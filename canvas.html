@@ -1,0 +1,314 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>故事画布 - Lumin</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "Microsoft YaHei", sans-serif; background: #0f172a; overflow: hidden; height: 100vh; }
+#toolbar { position: fixed; top: 0; left: 0; right: 0; height: 44px; background: #1e293b; display: flex; align-items: center; padding: 0 16px; gap: 8px; z-index: 100; border-bottom: 1px solid #334155; }
+#toolbar button { padding: 6px 14px; border: 1px solid #475569; border-radius: 6px; background: #334155; color: #e2e8f0; cursor: pointer; font-size: 13px; transition: all .15s; }
+#toolbar button:hover { background: #475569; border-color: #64748b; }
+#toolbar button.active { background: #6366f1; border-color: #818cf8; }
+#toolbar span.sep { width: 1px; height: 20px; background: #475569; margin: 0 4px; }
+#toolbar input { padding: 6px 10px; border: 1px solid #475569; border-radius: 6px; background: #1e293b; color: #e2e8f0; font-size: 13px; outline: none; width: 200px; }
+#toolbar input:focus { border-color: #6366f1; }
+#canvas-wrap { width: 100%; height: calc(100vh - 44px); cursor: grab; position: relative; }
+#canvas-wrap:active { cursor: grabbing; }
+#canvas-wrap.drawing-edge { cursor: crosshair; }
+svg { width: 100%; height: 100%; }
+.node-group { cursor: pointer; }
+.node-group text { fill: #e2e8f0; font-size: 12px; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+.node-rect { stroke-width: 2; stroke-opacity: 0.8; }
+.edge-line { stroke: #475569; stroke-width: 2; cursor: pointer; }
+.edge-line:hover { stroke: #ef4444; stroke-width: 4; }
+.edge-label { fill: #94a3b8; font-size: 11px; text-anchor: middle; pointer-events: none; }
+#context-menu { position: fixed; background: #1e293b; border: 1px solid #475569; border-radius: 8px; padding: 4px 0; display: none; z-index: 200; min-width: 120px; }
+#context-menu div { padding: 8px 16px; color: #e2e8f0; cursor: pointer; font-size: 13px; }
+#context-menu div:hover { background: #334155; }
+#context-menu div.danger { color: #f87171; }
+#status { position: fixed; bottom: 12px; left: 12px; color: #64748b; font-size: 11px; z-index: 100; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button onclick="addNode('character')" title="添加人物节点">人物</button>
+  <button onclick="addNode('event')" title="添加事件节点">事件</button>
+  <button onclick="addNode('location')" title="添加地点节点">地点</button>
+  <button onclick="addNode('note')" title="添加便签">便签</button>
+  <span class="sep"></span>
+  <button onclick="saveCanvas()" title="Ctrl+S">保存</button>
+  <button onclick="loadFromDisk()">加载</button>
+  <span class="sep"></span>
+  <input type="text" id="bookPathInput" placeholder="书籍路径（如 D:\...\我的小说）" />
+</div>
+
+<div id="canvas-wrap">
+  <svg id="svg"></svg>
+</div>
+
+<div id="context-menu">
+  <div onclick="editNode()">编辑</div>
+  <div onclick="addEdgeFromMenu()">连线到...</div>
+  <div class="danger" onclick="deleteSelected()">删除</div>
+</div>
+
+<div id="status">就绪 | 双击创建节点 | 拖动移动 | Shift+点击连线 | 右键菜单</div>
+
+<script>
+var API = window.luminAPI;
+var bookPath = "";
+var canvasData = { nodes: [], edges: [] };
+var nodeColors = { character: "#6366f1", event: "#f59e0b", location: "#10b981", note: "#8b5cf6", chapter: "#ef4444" };
+
+var NODE_W = 120, NODE_H = 50;
+var selectedNode = null;
+var selectedEdge = null;
+var dragging = false;
+var dragNode = null;
+var dragOX = 0, dragOY = 0;
+var connectingFrom = null;
+var contextX = 0, contextY = 0;
+var panX = 0, panY = 0;
+var panning = false;
+var panStart = { x: 0, y: 0 };
+
+var svg = document.getElementById("svg");
+var canvasWrap = document.getElementById("canvas-wrap");
+var contextMenu = document.getElementById("context-menu");
+var statusDiv = document.getElementById("status");
+
+// 加载颜色
+(async function init() {
+  if (API && API.canvas && API.canvas.getColors) {
+    try { var r = await API.canvas.getColors(); if (r.success) nodeColors = r.colors; } catch(e) {}
+  }
+  statusDiv.textContent = "就绪 | 双击创建节点 | 拖动移动 | Shift+点击连线 | 右键菜单";
+})();
+
+function status(msg) { statusDiv.textContent = msg; }
+
+// 添加节点
+async function addNode(type) {
+  if (!bookPath) { status("请先输入书籍路径"); return; }
+  var node = { type: type, label: prompt("节点名称", typeName(type)), x: 300 + Math.random() * 200, y: 200 + Math.random() * 200, color: nodeColors[type] };
+  if (!node.label) return;
+  var r = await API.canvas.addNode(bookPath, node);
+  if (r.success) { canvasData.nodes.push(r.node); render(); status("已添加: " + r.node.label); }
+}
+
+function typeName(t) { return { character: "新人物", event: "新事件", location: "新地点", note: "便签" }[t] || "节点"; }
+
+// 渲染
+function render() {
+  svg.innerHTML = "";
+  var gTransform = "translate(" + panX + "," + panY + ")";
+  var g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  g.setAttribute("transform", gTransform);
+
+  // 画线
+  canvasData.edges.forEach(function(e) {
+    var sn = canvasData.nodes.find(function(n) { return n.id === e.source; });
+    var tn = canvasData.nodes.find(function(n) { return n.id === e.target; });
+    if (!sn || !tn) return;
+    var line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", sn.x + NODE_W / 2);
+    line.setAttribute("y1", sn.y + NODE_H / 2);
+    line.setAttribute("x2", tn.x + NODE_W / 2);
+    line.setAttribute("y2", tn.y + NODE_H / 2);
+    line.setAttribute("class", "edge-line");
+    line.setAttribute("data-edge-id", e.id);
+    line.onclick = function(ev) { selectEdge(e.id, ev); };
+    g.appendChild(line);
+    if (e.label) {
+      var el = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      el.setAttribute("x", (sn.x + tn.x + NODE_W) / 2);
+      el.setAttribute("y", (sn.y + tn.y + NODE_H) / 2 - 6);
+      el.setAttribute("class", "edge-label");
+      el.textContent = e.label;
+      g.appendChild(el);
+    }
+  });
+
+  // 画节点
+  canvasData.nodes.forEach(function(n) {
+    var ng = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    ng.setAttribute("class", "node-group");
+    ng.setAttribute("data-node-id", n.id);
+    ng.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+    ng.onmousedown = function(ev) { onNodeDown(n, ev); };
+    ng.oncontextmenu = function(ev) { ev.preventDefault(); onContextMenu(n, null, ev); };
+
+    var rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rect.setAttribute("width", NODE_W);
+    rect.setAttribute("height", NODE_H);
+    rect.setAttribute("rx", 8);
+    rect.setAttribute("ry", 8);
+    rect.setAttribute("class", "node-rect");
+    rect.setAttribute("fill", n.color || "#8b5cf6");
+    rect.setAttribute("stroke", n.color || "#8b5cf6");
+    rect.setAttribute("fill-opacity", "0.25");
+    ng.appendChild(rect);
+
+    var txt = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    txt.setAttribute("x", NODE_W / 2);
+    txt.setAttribute("y", NODE_H / 2 - 4);
+    txt.textContent = n.label || "(无名称)";
+    ng.appendChild(txt);
+
+    var typeTag = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    typeTag.setAttribute("x", NODE_W / 2);
+    typeTag.setAttribute("y", NODE_H / 2 + 14);
+    typeTag.setAttribute("fill", "#94a3b8");
+    typeTag.setAttribute("font-size", "10");
+    typeTag.textContent = typeTagName(n.type);
+    ng.appendChild(typeTag);
+
+    g.appendChild(ng);
+  });
+
+  svg.appendChild(g);
+}
+
+function typeTagName(t) { return { character: "人物", event: "事件", location: "地点", note: "便签" }[t] || t; }
+
+// 节点鼠标事件
+function onNodeDown(n, ev) {
+  if (ev.shiftKey) {
+    // 连线模式
+    if (!connectingFrom) { connectingFrom = n; status("已选起点: " + n.label + " | Shift+点击目标节点完成连线"); }
+    else if (connectingFrom.id !== n.id) { createEdge(connectingFrom.id, n.id); connectingFrom = null; }
+    else { connectingFrom = null; status("取消连线"); }
+    return;
+  }
+  dragNode = n;
+  dragOX = ev.clientX - n.x;
+  dragOY = ev.clientY - n.y;
+  dragging = true;
+  document.addEventListener("mousemove", onMouseMove);
+  document.addEventListener("mouseup", onMouseUp);
+}
+
+function onMouseMove(ev) {
+  if (dragging && dragNode) {
+    dragNode.x = ev.clientX - dragOX;
+    dragNode.y = ev.clientY - dragOY;
+    render();
+  }
+}
+
+function onMouseUp() {
+  dragging = false; dragNode = null;
+  document.removeEventListener("mousemove", onMouseMove);
+  document.removeEventListener("mouseup", onMouseUp);
+  autoSave();
+}
+
+// 连线
+async function createEdge(fromId, toId) {
+  if (!bookPath) return;
+  var label = prompt("连线标签（如：师徒、友情、发生在...）", "");
+  var r = await API.canvas.addEdge(bookPath, { source: fromId, target: toId, label: label || "", type: "relation" });
+  if (r.success) { canvasData.edges.push(r.edge); render(); status("已连线"); }
+}
+
+// 画布双击：创建节点
+canvasWrap.ondblclick = function(ev) {
+  if (!bookPath) { status("请先输入书籍路径"); return; }
+  var label = prompt("节点名称");
+  if (!label) return;
+  var types = ["character", "event", "location", "note"];
+  var type = types[Math.floor(Math.random() * 4)];
+  addNodeAt(type, ev.clientX - panX, ev.clientY - panY, label);
+};
+
+async function addNodeAt(type, x, y, label) {
+  if (!bookPath) return;
+  var r = await API.canvas.addNode(bookPath, { type: type, label: label, x: x, y: y });
+  if (r.success) { canvasData.nodes.push(r.node); render(); }
+}
+
+// 右键菜单
+function onContextMenu(n, e, ev) {
+  selectedNode = n;
+  selectedEdge = e;
+  contextX = ev.clientX; contextY = ev.clientY;
+  contextMenu.style.left = contextX + "px";
+  contextMenu.style.top = contextY + "px";
+  contextMenu.style.display = "block";
+  document.addEventListener("click", hideContextMenu, { once: true });
+}
+
+function hideContextMenu() { contextMenu.style.display = "none"; }
+
+function selectEdge(id, ev) {
+  selectedEdge = canvasData.edges.find(function(e) { return e.id === id; });
+  selectedNode = null;
+  onContextMenu(null, selectedEdge, ev);
+}
+
+async function editNode() {
+  if (!selectedNode) return;
+  var label = prompt("修改名称", selectedNode.label);
+  if (label !== null) {
+    await API.canvas.updateNode(bookPath, selectedNode.id, { label: label });
+    selectedNode.label = label; render(); autoSave();
+  }
+}
+
+function addEdgeFromMenu() {
+  if (!selectedNode) return;
+  connectingFrom = selectedNode;
+  status("请 Shift+点击目标节点");
+}
+
+async function deleteSelected() {
+  if (!bookPath) return;
+  if (selectedNode) {
+    await API.canvas.deleteNode(bookPath, selectedNode.id);
+    canvasData.nodes = canvasData.nodes.filter(function(n) { return n.id !== selectedNode.id; });
+    canvasData.edges = canvasData.edges.filter(function(e) { return e.source !== selectedNode.id && e.target !== selectedNode.id; });
+  } else if (selectedEdge) {
+    await API.canvas.deleteEdge(bookPath, selectedEdge.id);
+    canvasData.edges = canvasData.edges.filter(function(e) { return e.id !== selectedEdge.id; });
+  }
+  render(); autoSave(); status("已删除");
+}
+
+// 保存/加载
+async function saveCanvas() {
+  if (!bookPath) { status("请先输入书籍路径"); return; }
+  await API.canvas.save(bookPath, canvasData);
+  status("已保存 " + new Date().toLocaleTimeString());
+}
+
+async function loadFromDisk() {
+  if (!bookPath) { status("请先输入书籍路径"); return; }
+  var r = await API.canvas.load(bookPath);
+  if (r.success) {
+    canvasData.nodes = r.nodes || [];
+    canvasData.edges = r.edges || [];
+    render(); status("已加载 " + canvasData.nodes.length + " 个节点, " + canvasData.edges.length + " 条连线");
+  } else {
+    status("加载失败: " + (r.error || "未知错误"));
+  }
+}
+
+function autoSave() { if (bookPath) API.canvas.save(bookPath, canvasData).catch(function(){}); }
+
+// 快捷键
+document.onkeydown = function(ev) {
+  if (ev.key === "s" && ev.ctrlKey) { ev.preventDefault(); saveCanvas(); }
+  if (ev.key === "Escape") { connectingFrom = null; hideContextMenu(); status("就绪"); }
+};
+
+// 路径输入
+document.getElementById("bookPathInput").onchange = function() {
+  bookPath = this.value.trim();
+  if (bookPath) loadFromDisk();
+};
+</script>
+</body>
+</html>
